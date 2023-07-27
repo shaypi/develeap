@@ -1,0 +1,23 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: develeap
+  namespace: argocd
+spec:
+  project: default
+
+  source:
+    repoURL: https://github.com/shaypi/develeap.git
+    targetRevision: HEAD
+    path: app
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: bluewhite
+  
+  syncPolicy:
+    syncOptions:
+    - CreateNamespace=true
+    automated:
+      selfHeal: true
+      prune: true
+    

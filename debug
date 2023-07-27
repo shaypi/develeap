@@ -1,0 +1,102 @@
+pipeline {
+    agent {
+        docker { image 'custom-jenkins-docker:latest'}
+    }
+    
+    environment {
+        AWS_REGION = 'eu-west-1'
+        AWS_ACCESS_KEY_ID = credentials('aws-key-id')
+        AWS_SECRET_ACCESS_KEY = credentials('aws-secret-key')
+    }
+
+    options {
+            disableConcurrentBuilds()
+            skipDefaultCheckout()
+            timestamps()
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout([$class: 'GitSCM', branches: [[name: '*/main']], userRemoteConfigs: [[url: 'https://github.com/shaypi/develeap']]])
+            }
+        }
+
+        stage('Install Dependencies and AWS CLI') {
+            steps {
+                script {
+                    sh '''
+                        # Install third-party dependencies
+                        apt-get update && apt-get install -y zip curl
+
+                        # Install AWS CLI
+                        curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+                        unzip -o awscliv2.zip
+                        ./aws/install
+                        apt-get update
+                        apt-get dist-upgrade -y
+                        apt-get install -y less
+                    '''
+                }
+            }
+        }
+
+        stage('Install Terraform') {
+            steps {
+                sh 'DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get -y install software-properties-common'
+                sh 'apt-get update && apt-get install -y gnupg wget'
+                sh 'wget -O- https://apt.releases.hashicorp.com/gpg | gpg --dearmor | tee /usr/share/keyrings/hashicorp-archive-keyring.gpg'
+                sh 'gpg --no-default-keyring --keyring /usr/share/keyrings/hashicorp-archive-keyring.gpg --fingerprint'
+                sh 'echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/hashicorp.list'
+                sh 'apt update'
+                sh 'apt-get -y install terraform'
+                sh 'terraform --version'
+            }
+        }
+
+        stage('Configure AWS credentials') {
+            steps {
+                sh 'mkdir ~/.aws'
+                sh 'echo "[default]" > ~/.aws/credentials'
+                sh 'echo "aws_access_key_id=${AWS_ACCESS_KEY_ID}" >> ~/.aws/credentials'
+                sh 'echo "aws_secret_access_key=${AWS_SECRET_ACCESS_KEY}" >> ~/.aws/credentials'
+                sh 'echo "[default]" > ~/.aws/config'
+                sh 'echo "region=${AWS_REGION}" >> ~/.aws/config'
+            }
+        }
+
+        stage('Install Kubectl') {
+            steps {
+                script {
+                    sh 'curl -LO "https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl"'
+                    sh 'chmod +x ./kubectl'
+                    sh 'mv ./kubectl /usr/local/bin/kubectl'
+                    sh 'kubectl version --client --output=yaml'
+                }
+            }
+        }
+
+        stage('Install Helm') {
+            steps {
+                script {
+                    sh 'curl https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 > get_helm.sh'
+                    sh 'chmod 700 get_helm.sh'
+                    sh './get_helm.sh'
+                    sh 'helm version'
+                }
+            }
+        }
+        
+        stage('Connect to k8s cluster') {
+            steps {
+                sh 'aws eks --region eu-west-1 update-kubeconfig --name bluewhite'
+            }
+        }
+
+        stage('debug') {
+            steps {
+                sh 'sleep 60000'
+            }
+        }
+    }
+}

@@ -1,0 +1,221 @@
+pipeline {
+    agent {
+        docker { image 'custom-jenkins-docker:latest'}
+    }
+    
+    environment {
+        AWS_REGION = 'eu-west-1'
+        AWS_ACCESS_KEY_ID = credentials('aws-key-id')
+        AWS_SECRET_ACCESS_KEY = credentials('aws-secret-key')
+    }
+
+    options {
+            disableConcurrentBuilds()
+            skipDefaultCheckout()
+            timestamps()
+    }
+
+    parameters {
+        choice(
+            choices: ['apply', 'destroy'],
+            description: 'Apply or Destroy',
+            name: 'CONDITION',
+        )
+    }
+
+    // triggers {
+    //     GenericTrigger(
+    //             genericVariables: [
+    //                     [key: 'Commit_id', value: '$.pull_request.head.sha', defaultValue: 'None'],
+    //                     [key: 'PR_number', value: '$.number', defaultValue: 'None'],
+    //                     [key: 'Repository', value: '$.pull_request.base.repo.full_name', defaultValue: 'None'],
+    //                     [key: 'User', value: '$.pull_request.user.login', defaultValue: 'None'],
+    //                     [key: 'action', value: '$.action', defaultValue: 'None'],
+    //             ],
+
+    //             causeString: 'Triggered on $PR_number',
+    //             token: 'develeap',
+    //             printContributedVariables: true,
+    //             printPostContent: true,
+    //             silentResponse: false,
+    //             regexpFilterText: '$action',
+    //             regexpFilterExpression: '(opened|reopened|synchronize)'
+    //     )
+    // }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout([$class: 'GitSCM', branches: [[name: '*/main']], userRemoteConfigs: [[url: 'https://github.com/shaypi/develeap']]])
+            }
+        }
+
+        stage('Install Dependencies and AWS CLI') {
+            steps {
+                script {
+                    sh '''
+                        # Install third-party dependencies
+                        apt-get update && apt-get install -y zip curl
+
+                        # Install AWS CLI
+                        curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+                        unzip -o awscliv2.zip
+                        ./aws/install
+                        apt-get update
+                        apt-get dist-upgrade -y
+                        apt-get install -y less
+                    '''
+                }
+            }
+        }
+
+        stage('Install Terraform') {
+            steps {
+                sh 'DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get -y install software-properties-common'
+                sh 'apt-get update && apt-get install -y gnupg wget'
+                sh 'wget -O- https://apt.releases.hashicorp.com/gpg | gpg --dearmor | tee /usr/share/keyrings/hashicorp-archive-keyring.gpg'
+                sh 'gpg --no-default-keyring --keyring /usr/share/keyrings/hashicorp-archive-keyring.gpg --fingerprint'
+                sh 'echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/hashicorp.list'
+                sh 'apt update'
+                sh 'apt-get -y install terraform'
+                sh 'terraform --version'
+            }
+        }
+
+        stage('Configure AWS credentials') {
+            steps {
+                sh 'mkdir ~/.aws'
+                sh 'echo "[default]" > ~/.aws/credentials'
+                sh 'echo "aws_access_key_id=${AWS_ACCESS_KEY_ID}" >> ~/.aws/credentials'
+                sh 'echo "aws_secret_access_key=${AWS_SECRET_ACCESS_KEY}" >> ~/.aws/credentials'
+                sh 'echo "[default]" > ~/.aws/config'
+                sh 'echo "region=${AWS_REGION}" >> ~/.aws/config'
+            }
+        }
+
+        stage('Configure backend') {
+            steps {
+                dir('terraform/environments/test/develeap') {
+                    sh '''
+                        cat <<EOF > develeap-backend.conf
+                        encrypt = true
+                        bucket = "develeap-global-state"
+                        key = "env/develeap/terraform.tfstate"
+                        region = "${AWS_REGION}"
+                        access_key = "${AWS_ACCESS_KEY_ID}"
+                        secret_key = "${AWS_SECRET_ACCESS_KEY}"
+                    '''
+                }
+            }
+        }
+
+        stage('Initialize Terraform') {
+            steps {
+                dir('terraform/environments/test/develeap') {
+                    sh 'terraform init -backend-config=develeap-backend.conf'
+                }
+            }
+        }
+
+        stage('Terraform Plan') {
+            steps {
+                dir('terraform/environments/test/develeap') {
+                    sh '''
+                        terraform validate
+                        terraform fmt
+                        terraform init -backend-config=develeap-backend.conf
+                        terraform plan -var-file="develeap.tfvars"
+                    '''
+                }
+            }
+            post {
+                failure {
+                    error('Terraform plan failed. Halting the pipeline.')
+                }
+            }
+        }
+
+        // stage('debug') {
+        //     steps {
+        //         sh 'sleep 60000'
+        //     }
+        // }
+
+        stage('Terraform Apply/Destroy') {
+            steps {
+                dir('terraform/environments/test/develeap') {
+                    sh '''
+                        terraform validate
+                        terraform fmt
+                        terraform init -backend-config=develeap-backend.conf
+                        terraform apply -var-file="develeap.tfvars" -auto-approve
+                    '''
+                }
+            }
+            post {
+                always {
+                    echo 'Terraform apply/destroy complete!'
+                }
+            }
+        }
+
+        stage('Install Kubectl') {
+            steps {
+                script {
+                    sh 'curl -LO "https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl"'
+                    sh 'chmod +x ./kubectl'
+                    sh 'mv ./kubectl /usr/local/bin/kubectl'
+                    sh 'kubectl version --client --output=yaml'
+                }
+            }
+        }
+
+        stage('Install Helm') {
+            steps {
+                script {
+                    sh 'curl https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 > get_helm.sh'
+                    sh 'chmod 700 get_helm.sh'
+                    sh './get_helm.sh'
+                    sh 'helm version'
+                }
+            }
+        }
+        
+        stage('Connect to k8s cluster') {
+            steps {
+                sh 'aws eks --region eu-west-1 update-kubeconfig --name develeap'
+            }
+        }
+
+        stage('Update AWS LB Controller ServiceAccount') {
+            steps {
+                 dir('app') {
+                     sh 'kubectl apply -f sa.yaml'
+                }
+            }
+        }
+
+        stage('Install AWS LB Controller') {
+            steps {
+                script {
+                    sh 'helm repo add eks https://aws.github.io/eks-charts'
+                    sh 'helm repo update'
+                    sh 'helm upgrade -i aws-load-balancer-controller eks/aws-load-balancer-controller --namespace kube-system --set clusterName=develeap --set serviceAccount.create=false --set serviceAccount.name=cluster-autoscaler'
+                }
+            }
+        }
+
+        stage('Install ArgoCD') {
+            steps {
+                script {
+                    sh 'kubectl create ns argocd --dry-run=client -o yaml | kubectl apply -f -'
+                    sh 'kubectl create ns develeap --dry-run=client -o yaml | kubectl apply -f -'
+                    sh 'helm repo add argo https://argoproj.github.io/argo-helm'
+                    sh 'helm repo update'
+                    sh 'helm upgrade -i argocd argo/argo-cd --namespace argocd'
+                    sh 'kubectl apply -f argo-app.yaml'
+                }
+            }
+        }
+    }
+}
